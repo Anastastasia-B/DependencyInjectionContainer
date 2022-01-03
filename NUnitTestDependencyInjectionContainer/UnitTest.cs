@@ -67,6 +67,18 @@ namespace NUnitTestDependencyInjectionContainer
         }
 
         [Test]
+        public void CheckSingletone()
+        {
+            var dependencies = new DependenciesConfiguration();
+            dependencies.Register<ITest1, Test1Impl1>(DependencyLifeTime.Singletone);
+            var provider = new DependencyProvider(dependencies);
+            var first = provider.Resolve<ITest1>();
+            var second = provider.Resolve<ITest1>();
+
+            Assert.AreEqual(first, second);
+        }
+
+        [Test]
         public void CheckConstructorParamWithoutImplemetation()
         {
             var dependencies = new DependenciesConfiguration();
