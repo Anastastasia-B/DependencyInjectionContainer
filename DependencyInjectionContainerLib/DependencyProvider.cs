@@ -10,10 +10,26 @@ namespace DependencyInjectionContainerLib
 {
     public class DependencyProvider
     {
+        class FindCycleResult
+        {
+            public object instance;
+            public FieldInfo field;
+
+            public FindCycleResult(object instance, FieldInfo field)
+            {
+                this.instance = instance;
+                this.field = field;
+            }
+        }
+
         private DependenciesConfiguration _dependencies;
+        private CycleDepDetector cycleDepDetector;
+        private bool resolveCycleDep = false;
+
         public DependencyProvider(DependenciesConfiguration dependencies)
         {
             _dependencies = dependencies;
+            cycleDepDetector = new CycleDepDetector();
         }
 
         public T Resolve<T>()
@@ -24,36 +40,92 @@ namespace DependencyInjectionContainerLib
         private object Resolve(Type type, bool createAllImplementations)
         {
             object instance = null;
+            if (cycleDepDetector.IsCycleDependencyDetected(type))
+            {
+                return null;
+            }
+
+            cycleDepDetector.PushType(type);
+
             List<Type> implementations = null;
+            IDependencyLife dependencyLifeObject = null;
             if (!_dependencies.TryGetValue(type, out implementations))
             {
                 if (type.GetInterface("IEnumerable") != null && type.IsGenericType)
                 {
                     instance = Resolve(type.GetGenericArguments().First(), true);
                 }
+                else
+                {
+                    if(type.GetConstructors().Count() == 0)
+                    {
+                        instance = Activator.CreateInstance(type);
+                    }
+                    else
+                    {
+                        dependencyLifeObject = (IDependencyLife)ObjectCreator.CreateInstance(type, type.GetGenericArguments());
+                        var instType = type.GenericTypeArguments[0];
+                        var parameters = GetConstructorParams(instType, type.GetGenericTypeDefinition());
+                        instance = dependencyLifeObject.GetInstance(parameters);
+                    }
+                }
             }
             else
             {
-                IDependencyLife dependencyLifeObject = null;
                 if (createAllImplementations)
                 {
                     instance = Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
                     for (int i = 0; i < implementations.Count; i++)
                     {
                         dependencyLifeObject = (IDependencyLife)ObjectCreator.CreateInstance(implementations[i], type.GetGenericArguments());
-                        (instance as IList).Add(dependencyLifeObject.GetInstance(GetConstructorParams(implementations[i].GenericTypeArguments[0])));
+                        (instance as IList).Add(dependencyLifeObject.GetInstance(GetConstructorParams(implementations[i].GenericTypeArguments[0], implementations[i])));
                     }
                 }
                 else
                 {
                     dependencyLifeObject = (IDependencyLife)ObjectCreator.CreateInstance(implementations[0], type.GetGenericArguments());
-                    instance = dependencyLifeObject.GetInstance(GetConstructorParams(implementations[0].GenericTypeArguments[0]));
+                    var parameters = GetConstructorParams(implementations[0].GenericTypeArguments[0], implementations[0].GetGenericTypeDefinition());
+                    instance = dependencyLifeObject.GetInstance(parameters);
                 }
             }
+            cycleDepDetector.PopType();
             return instance;
         }
 
-        private object[] GetConstructorParams(Type type)
+        private bool TryResolveCycleDep(List<object> constructorParams)
+        {
+            foreach(object parameter in constructorParams)
+            {
+                FindCycleResult result = FindCycle(parameter, parameter.GetType());
+                if(result != null)
+                {
+                    result.field.SetValue(result.instance, parameter);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private FindCycleResult FindCycle(object inst, Type type)
+        {
+            FieldInfo[] fields = inst.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance);
+            foreach (FieldInfo field in fields)
+            {
+                if (field.FieldType.Equals(type))
+                {
+                    return new FindCycleResult(inst, field);
+                }
+                if(field.GetValue(inst) != null)
+                {
+                    FindCycleResult result = FindCycle(field.GetValue(inst), type);
+                    if (result != null)
+                        return result;
+                }
+            }
+            return null;
+        }
+
+        private object[] GetConstructorParams(Type type, Type lifeType)
         {
             List<object> constructorParams = new List<object>();
             ConstructorInfo constructor = type.GetConstructors().OrderByDescending(con => con.GetParameters().Length).First();
@@ -61,7 +133,21 @@ namespace DependencyInjectionContainerLib
             ParameterInfo[] parameters = constructor.GetParameters();
             for (int i = 0; i < parameters.Length; i++)
             {
-                constructorParams.Add(Resolve(parameters[i].ParameterType, false));
+                Type paramType = parameters[i].ParameterType;
+                var param = Resolve(lifeType.MakeGenericType(paramType), false);
+                constructorParams.Add(param);
+
+                if (lifeType.Equals(typeof(Singletone<>).GetGenericTypeDefinition()))
+                {
+                    if (resolveCycleDep && TryResolveCycleDep(constructorParams))
+                    {
+                        resolveCycleDep = false;
+                    }
+                    if (param == null)
+                    {
+                        resolveCycleDep = true;
+                    }
+                }
             }
 
             return constructorParams.ToArray();
